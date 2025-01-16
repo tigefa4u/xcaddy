@@ -15,6 +15,7 @@
 package xcaddy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/caddyserver/xcaddy/internal/utils"
 )
 
 // Builder can produce a custom Caddy build with the
@@ -45,6 +47,12 @@ type Builder struct {
 	Debug        bool          `json:"debug,omitempty"`
 	BuildFlags   string        `json:"build_flags,omitempty"`
 	ModFlags     string        `json:"mod_flags,omitempty"`
+
+	// Experimental: subject to change
+	EmbedDirs []struct {
+		Dir  string `json:"dir,omitempty"`
+		Name string `json:"name,omitempty"`
+	} `json:"embed_dir,omitempty"`
 }
 
 // Build builds Caddy at the configured version with the
@@ -66,13 +74,14 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 	if err != nil {
 		return err
 	}
+	log.Printf("[INFO] absolute output file path: %s", absOutputFile)
 
 	// set some defaults from the environment, if applicable
 	if b.OS == "" {
-		b.OS = os.Getenv("GOOS")
+		b.OS = utils.GetGOOS()
 	}
 	if b.Arch == "" {
-		b.Arch = os.Getenv("GOARCH")
+		b.Arch = utils.GetGOARCH()
 	}
 	if b.ARM == "" {
 		b.ARM = os.Getenv("GOARM")
@@ -84,6 +93,34 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 		return err
 	}
 	defer buildEnv.Close()
+
+	// generating windows resources for embedding
+	if b.OS == "windows" {
+		// get version string, we need to parse the output to get the exact version instead tag, branch or commit
+		cmd, err := buildEnv.newGoBuildCommand(ctx, "list", "-m", buildEnv.caddyModulePath)
+		if err != nil {
+			return err
+		}
+		var buffer bytes.Buffer
+		cmd.Stdout = &buffer
+		err = buildEnv.runCommand(ctx, cmd)
+		if err != nil {
+			return err
+		}
+
+		// output looks like: github.com/caddyserver/caddy/v2 v2.7.6
+		version := strings.TrimPrefix(buffer.String(), buildEnv.caddyModulePath)
+		// if caddy replacement is a local directory, version will be
+		// like v2.8.4 => c:\Users\test\caddy
+		// see https://github.com/caddyserver/xcaddy/issues/215
+		// strings.Cut return the string unchanged if separator is not found
+		version, _, _ = strings.Cut(version, "=>")
+		version = strings.TrimSpace(version)
+		err = utils.WindowsResource(version, outputFile, buildEnv.tempFolder)
+		if err != nil {
+			return err
+		}
+	}
 
 	if b.SkipBuild {
 		log.Printf("[INFO] Skipping build as requested")
@@ -113,9 +150,12 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 	}
 
 	// compile
-	cmd := buildEnv.newGoBuildCommand(ctx, "build",
+	cmd, err := buildEnv.newGoBuildCommand(ctx, "build",
 		"-o", absOutputFile,
 	)
+	if err != nil {
+		return err
+	}
 	if b.Debug {
 		// support dlv
 		cmd.Args = append(cmd.Args, "-gcflags", "all=-N -l")
@@ -124,6 +164,7 @@ func (b Builder) Build(ctx context.Context, outputFile string) error {
 			cmd.Args = append(cmd.Args,
 				"-ldflags", "-w -s", // trim debug symbols
 				"-trimpath",
+				"-tags", "nobadger,nomysql,nopgx",
 			)
 		}
 	}
@@ -168,6 +209,13 @@ type Dependency struct {
 
 	// The version of the Go module, as used with `go get`.
 	Version string `json:"version,omitempty"`
+}
+
+func (d Dependency) String() string {
+	if d.Version != "" {
+		return d.PackagePath + "@" + d.Version
+	}
+	return d.PackagePath
 }
 
 // ReplacementPath represents an old or new path component

@@ -18,7 +18,7 @@ You can [download binaries](https://github.com/caddyserver/xcaddy/releases) that
 You may also build `xcaddy` from source:
 
 ```bash
-$ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 ```
 
 For Debian, Ubuntu, and Raspbian, an `xcaddy` package is available from our [Cloudsmith repo](https://cloudsmith.io/~caddy/repos/xcaddy/packages/):
@@ -62,6 +62,8 @@ Syntax:
 $ xcaddy build [<caddy_version>]
     [--output <file>]
     [--with <module[@version][=replacement]>...]
+    [--replace <module[@version]=replacement>...]
+    [--embed <[alias]:path/to/dir>...]
 ```
 
 - `<caddy_version>` is the core Caddy version to build; defaults to `CADDY_VERSION` env variable or latest.<br>
@@ -71,9 +73,14 @@ $ xcaddy build [<caddy_version>]
   - A commit like `a58f240d3ecbb59285303746406cab50217f8d24`
 
 - `--output` changes the output file.
+
 - `--with` can be used multiple times to add plugins by specifying the Go module name and optionally its version, similar to `go get`. Module name is required, but specific version and/or local replacement are optional.
 
-Examples:
+- `--replace` is like `--with`, but does not add a blank import to the code; it only writes a replace directive to `go.mod`, which is useful when developing on Caddy's dependencies (ones that are not Caddy modules). Try this if you got an error when using `--with`, like `cannot find module providing package`.
+
+- `--embed` can be used to embed the contents of a directory into the Caddy executable. `--embed` can be passed multiple times with separate source directories. The source directory can be prefixed with a custom alias and a colon `:` to write the embedded files into an aliased subdirectory, which is useful when combined with the `root` directive and sub-directive.
+
+#### Examples
 
 ```bash
 $ xcaddy build \
@@ -107,6 +114,67 @@ $ xcaddy build \
 
 This allows you to hack on Caddy core (and optionally plug in extra modules at the same time!) with relative ease.
 
+---
+
+If `--embed` is used without an alias prefix, the contents of the source directory are written directly into the root directory of the embedded filesystem within the Caddy executable. The contents of multiple unaliased source directories will be merged together:
+
+```
+$ xcaddy build --embed ./my-files --embed ./my-other-files
+$ cat Caddyfile
+{
+	# You must declare a custom filesystem using the `embedded` module.
+	# The first argument to `filesystem` is an arbitrary identifier
+	# that will also be passed to `fs` directives.
+	filesystem my_embeds embedded
+}
+
+localhost {
+	# This serves the files or directories that were
+	# contained inside of ./my-files and ./my-other-files
+	file_server {
+		fs my_embeds
+	}
+}
+```
+
+You may also prefix the source directory with a custom alias and colon separator to write the source directory's contents to a separate subdirectory within the `embedded` filesystem:
+
+```
+$ xcaddy build --embed foo:./sites/foo --embed bar:./sites/bar
+$ cat Caddyfile
+{
+	filesystem my_embeds embedded
+}
+
+foo.localhost {
+	# This serves the files or directories that were
+	# contained inside of ./sites/foo
+	root * /foo
+	file_server {
+		fs my_embeds
+	}
+}
+
+bar.localhost {
+	# This serves the files or directories that were
+	# contained inside of ./sites/bar
+	root * /bar
+	file_server {
+		fs my_embeds
+	}
+}
+```
+
+This allows you to serve 2 sites from 2 different embedded directories, which are referenced by aliases, from a single Caddy executable.
+
+---
+
+If you need to work on Caddy's dependencies, you can use the `--replace` flag to replace it with a local copy of that dependency (or your fork on github etc if you need):
+
+```
+$ xcaddy build some-branch-on-caddy \
+    --replace golang.org/x/net=../net
+```
 
 ### For plugin development
 
@@ -171,7 +239,7 @@ Because the subcommands and flags are constrained to benefit rapid plugin protot
 - `XCADDY_SKIP_BUILD=1` causes xcaddy to not compile the program, it is used in conjunction with build tools such as [GoReleaser](https://goreleaser.com). Implies `XCADDY_SKIP_CLEANUP=1`.
 - `XCADDY_SKIP_CLEANUP=1` causes xcaddy to leave build artifacts on disk after exiting.
 - `XCADDY_WHICH_GO` sets the go command to use when for example more then 1 version of go is installed.
-- `XCADDY_GO_BUILD_FLAGS` overrides default build arguments. Supports Unix-style shell quoting, for example: XCADDY_GO_BUILD_FLAGS="-ldflags '-w s'". The provided flags are applied to `go` commands: build, clean, get, install, list, run, and test
+- `XCADDY_GO_BUILD_FLAGS` overrides default build arguments. Supports Unix-style shell quoting, for example: XCADDY_GO_BUILD_FLAGS="-ldflags '-w -s'". The provided flags are applied to `go` commands: build, clean, get, install, list, run, and test
 - `XCADDY_GO_MOD_FLAGS` overrides default `go mod` arguments. Supports Unix-style shell quoting.
 
 ---

@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
-        go: [ '1.19', '1.20' ]
+        go: [ '1.22', '1.23' ]
 
         # Set some variables per OS, usable via ${{ matrix.VAR }}
         # XCADDY_BIN_PATH: the path to the compiled xcaddy binary, for artifact publishing
@@ -39,15 +39,16 @@ jobs:
 
     steps:
     - name: Install Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go }}
 
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Print Go version and environment
       id: vars
+      shell: bash
       run: |
         printf "Using go at: $(which go)\n"
         printf "Go version: $(go version)\n"
@@ -59,7 +60,7 @@ jobs:
         echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     - name: Cache the build cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         # In order:
         # * Module download cache
@@ -83,6 +84,7 @@ jobs:
       working-directory: ./cmd/xcaddy
       env:
         CGO_ENABLED: 0
+        GOARCH: amd64
       run: |
         go build -trimpath -ldflags="-w -s" -v
 
@@ -91,10 +93,11 @@ jobs:
         ${{ matrix.XCADDY_BIN_PATH }} version
 
     - name: Publish Build Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: xcaddy_${{ runner.os }}_go${{ matrix.go }}_${{ steps.vars.outputs.short_sha }}
         path: ${{ matrix.XCADDY_BIN_PATH }}
+        compression-level: 0
 
     - name: Run tests
       run: |
@@ -104,9 +107,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - uses: goreleaser/goreleaser-action@v4
+      - name: Print Go version and environment
+        id: vars
+        shell: bash
+        run: |
+          printf "Using go at: $(which go)\n"
+          printf "Go version: $(go version)\n"
+          printf "\n\nGo environment:\n\n"
+          go env
+          printf "\n\nSystem environment:\n\n"
+          env
+          # Calculate the short SHA1 hash of the git commit
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
           args: check

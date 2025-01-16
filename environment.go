@@ -86,9 +86,38 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 	// write the main module file to temporary folder
 	mainPath := filepath.Join(tempFolder, "main.go")
 	log.Printf("[INFO] Writing main module: %s\n%s", mainPath, buf.Bytes())
-	err = os.WriteFile(mainPath, buf.Bytes(), 0644)
+	err = os.WriteFile(mainPath, buf.Bytes(), 0o644)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(b.EmbedDirs) > 0 {
+		for _, d := range b.EmbedDirs {
+			err = copy(d.Dir, filepath.Join(tempFolder, "files", d.Name))
+			if err != nil {
+				return nil, err
+			}
+			_, err = os.Stat(d.Dir)
+			if err != nil {
+				return nil, fmt.Errorf("embed directory does not exist: %s", d.Dir)
+			}
+			log.Printf("[INFO] Embedding directory: %s", d.Dir)
+			buf.Reset()
+			tpl, err = template.New("embed").Parse(embeddedModuleTemplate)
+			if err != nil {
+				return nil, err
+			}
+			err = tpl.Execute(&buf, tplCtx)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("[INFO] Writing 'embedded' module: %s\n%s", mainPath, buf.Bytes())
+			emedPath := filepath.Join(tempFolder, "embed.go")
+			err = os.WriteFile(emedPath, buf.Bytes(), 0o644)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	env := &environment{
@@ -115,13 +144,17 @@ func (b Builder) newEnvironment(ctx context.Context) (*environment, error) {
 	replaced := make(map[string]string)
 	for _, r := range b.Replacements {
 		log.Printf("[INFO] Replace %s => %s", r.Old.String(), r.New.String())
-		cmd := env.newGoModCommand(ctx, "edit",
-			"-replace", fmt.Sprintf("%s=%s", r.Old.Param(), r.New.Param()))
+		replaced[r.Old.String()] = r.New.String()
+	}
+	if len(replaced) > 0 {
+		cmd := env.newGoModCommand(ctx, "edit")
+		for o, n := range replaced {
+			cmd.Args = append(cmd.Args, "-replace", fmt.Sprintf("%s=%s", o, n))
+		}
 		err := env.runCommand(ctx, cmd)
 		if err != nil {
 			return nil, err
 		}
-		replaced[r.Old.String()] = r.New.String()
 	}
 
 	// check for early abort
@@ -213,9 +246,16 @@ func (env environment) newCommand(ctx context.Context, command string, args ...s
 
 // newGoBuildCommand creates a new *exec.Cmd which assumes the first element in `args` is one of: build, clean, get, install, list, run, or test. The
 // created command will also have the value of `XCADDY_GO_BUILD_FLAGS` appended to its arguments, if set.
-func (env environment) newGoBuildCommand(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := env.newCommand(ctx, utils.GetGo(), args...)
-	return parseAndAppendFlags(cmd, env.buildFlags)
+func (env environment) newGoBuildCommand(ctx context.Context, goCommand string, args ...string) (*exec.Cmd, error) {
+	switch goCommand {
+	case "build", "clean", "get", "install", "list", "run", "test":
+	default:
+		return nil, fmt.Errorf("unsupported command of 'go': %s", goCommand)
+	}
+	cmd := env.newCommand(ctx, utils.GetGo(), goCommand)
+	cmd = parseAndAppendFlags(cmd, env.buildFlags)
+	cmd.Args = append(cmd.Args, args...)
+	return cmd, nil
 }
 
 // newGoModCommand creates a new *exec.Cmd which assumes `args` are the args for `go mod` command. The
@@ -242,8 +282,13 @@ func parseAndAppendFlags(cmd *exec.Cmd, flags string) *exec.Cmd {
 }
 
 func (env environment) runCommand(ctx context.Context, cmd *exec.Cmd) error {
-	deadline, _ := ctx.Deadline()
-	log.Printf("[INFO] exec (timeout=%s): %+v ", time.Until(deadline), cmd)
+	deadline, ok := ctx.Deadline()
+	var timeout time.Duration
+	// context doesn't necessarily have a deadline
+	if ok {
+		timeout = time.Until(deadline)
+	}
+	log.Printf("[INFO] exec (timeout=%s): %+v ", timeout, cmd)
 
 	// start the command; if it fails to start, report error immediately
 	err := cmd.Start()
@@ -282,7 +327,7 @@ func (env environment) runCommand(ctx context.Context, cmd *exec.Cmd) error {
 	}
 }
 
-// execGoGet runs "go get -d -v" with the given module/version as an argument.
+// execGoGet runs "go get -v" with the given module/version as an argument.
 // Also allows passing in a second module/version pair, meant to be the main
 // Caddy module/version we're building against; this will prevent the
 // plugin module from causing the Caddy version to upgrade, if the plugin
@@ -298,7 +343,10 @@ func (env environment) execGoGet(ctx context.Context, modulePath, moduleVersion,
 		caddy += "@" + caddyVersion
 	}
 
-	cmd := env.newGoBuildCommand(ctx, "get", "-d", "-v")
+	cmd, err := env.newGoBuildCommand(ctx, "get", "-v")
+	if err != nil {
+		return err
+	}
 	// using an empty string as an additional argument to "go get"
 	// breaks the command since it treats the empty string as a
 	// distinct argument, so we're using an if statement to avoid it.
@@ -331,4 +379,114 @@ import (
 func main() {
 	caddycmd.Main()
 }
+`
+
+// originally published in: https://github.com/mholt/caddy-embed
+const embeddedModuleTemplate = `package main
+
+import (
+	"embed"
+	"io/fs"
+	"strings"
+
+	"{{.CaddyModule}}"
+	"{{.CaddyModule}}/caddyconfig/caddyfile"
+)
+
+// embedded is what will contain your static files. The go command
+// will automatically embed the files subfolder into this virtual
+// file system. You can optionally change the go:embed directive
+// to embed other files or folders.
+//
+//go:embed files
+var embedded embed.FS
+
+// files is the actual, more generic file system to be utilized.
+var files fs.FS = embedded
+
+// topFolder is the name of the top folder of the virtual
+// file system. go:embed does not let us add the contents
+// of a folder to the root of a virtual file system, so
+// if we want to trim that root folder prefix, we need to
+// also specify it in code as a string. Otherwise the
+// user would need to add configuration or code to trim
+// this root prefix from all filenames, e.g. specifying
+// "root files" in their file_server config.
+//
+// It is NOT REQUIRED to change this if changing the
+// go:embed directive; it is just for convenience in
+// the default case.
+const topFolder = "files"
+
+func init() {
+	caddy.RegisterModule(FS{})
+	stripFolderPrefix()
+}
+
+// stripFolderPrefix opens the root of the file system. If it
+// contains only 1 file, being a directory with the same
+// name as the topFolder const, then the file system will
+// be fs.Sub()'ed so the contents of the top folder can be
+// accessed as if they were in the root of the file system.
+// This is a convenience so most users don't have to add
+// additional configuration or prefix their filenames
+// unnecessarily.
+func stripFolderPrefix() error {
+	if f, err := files.Open("."); err == nil {
+		defer f.Close()
+
+		if dir, ok := f.(fs.ReadDirFile); ok {
+			entries, err := dir.ReadDir(2)
+			if err == nil &&
+				len(entries) == 1 &&
+				entries[0].IsDir() &&
+				entries[0].Name() == topFolder {
+				if sub, err := fs.Sub(embedded, topFolder); err == nil {
+					files = sub
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// FS implements a Caddy module and fs.FS for an embedded
+// file system provided by an unexported package variable.
+//
+// To use, simply put your files in a subfolder called
+// "files", then build Caddy with your local copy of this
+// plugin. Your site's files will be embedded directly
+// into the binary.
+//
+// If the embedded file system contains only one file in
+// its root which is a folder named "files", this module
+// will strip that folder prefix using fs.Sub(), so that
+// the contents of the folder can be accessed by name as
+// if they were in the actual root of the file system.
+// In other words, before: files/foo.txt, after: foo.txt.
+type FS struct{}
+
+// CaddyModule returns the Caddy module information.
+func (FS) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "caddy.fs.embedded",
+		New: func() caddy.Module { return new(FS) },
+	}
+}
+
+func (FS) Open(name string) (fs.File, error) {
+	// TODO: the file server doesn't clean up leading and trailing slashes, but embed.FS is particular so we remove them here; I wonder if the file server should be tidy in the first place
+	name = strings.Trim(name, "/")
+	return files.Open(name)
+}
+
+// UnmarshalCaddyfile exists so this module can be used in
+// the Caddyfile, but there is nothing to unmarshal.
+func (FS) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
+
+// Interface guards
+var (
+	_ fs.FS                 = (*FS)(nil)
+	_ caddyfile.Unmarshaler = (*FS)(nil)
+)
 `
